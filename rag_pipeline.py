@@ -1,5 +1,34 @@
 import streamlit as st
 import os
+import logging
+import sys
+import warnings
+from dotenv import load_dotenv
+
+# Aggressive warning suppression
+warnings.filterwarnings("ignore")
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+os.environ["GLOG_minloglevel"] = "2"
+
+# Configure logging to be more robust
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stderr,
+    force=True
+)
+logger = logging.getLogger(__name__)
+
+# Guaranteed visibility debug log
+def debug_log(msg):
+    logger.info(msg)
+    print(f"\n>>> DEBUG_LOG [pipeline]: {msg}", file=sys.stderr, flush=True)
+
+
+load_dotenv()
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters.character import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -13,23 +42,26 @@ from langchain_classic.prompts import PromptTemplate
 # =========================
 def get_embeddings():
     return GoogleGenerativeAIEmbeddings(
-        model="models/text-embedding-004"
+        model="gemini-embedding-001"
     )
 
 # =========================
 # PDF PROCESSING
 # =========================
 def process_pdfs(uploaded_files, chat_id):
+    debug_log(f"Processing {len(uploaded_files)} PDF(s)")
     documents = []
     os.makedirs(f"temp_{chat_id}", exist_ok=True)
 
     for file in uploaded_files:
+        debug_log(f"Reading file: {file.name}")
         path = os.path.join(f"temp_{chat_id}", file.name)
         with open(path, "wb") as f:
             f.write(file.getbuffer())
 
         loader = PyPDFLoader(path)
         docs = loader.load()
+        debug_log(f"Loaded {len(docs)} pages from {file.name}")
 
         for d in docs:
             d.metadata["source"] = file.name
@@ -38,31 +70,45 @@ def process_pdfs(uploaded_files, chat_id):
 
     return documents
 
+
 # =========================
 # TEXT SPLITTING
 # =========================
 def split_docs(documents):
+    debug_log(f"Splitting {len(documents)} document pages into chunks")
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,
         chunk_overlap=250
     )
-    return splitter.split_documents(documents)
+    chunks = splitter.split_documents(documents)
+    debug_log(f"Created {len(chunks)} chunks")
+    return chunks
+
 
 # =========================
 # VECTOR STORE (CACHED)
 # =========================
 @st.cache_resource
 def create_vectorstore(docs, chat_id):
+    debug_log("Creating vectorstore from chunks")
     embeddings = get_embeddings()
     persist_dir = f"db_{chat_id}"
-    return Chroma.from_documents(docs, embedding=embeddings, persist_directory=persist_dir)
+    vs = Chroma.from_documents(docs, embedding=embeddings, persist_directory=persist_dir)
+    debug_log(f"Vectorstore created and persisted to {persist_dir}")
+    return vs
+
 
 def load_vectorstore(chat_id):
     persist_dir = f"db_{chat_id}"
+    debug_log(f"Attempting to load vectorstore from {persist_dir}")
     if os.path.exists(persist_dir) and os.path.isdir(persist_dir) and len(os.listdir(persist_dir)) > 0:
         embeddings = get_embeddings()
+        debug_log("Vectorstore found and directory is not empty.")
         return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
+    debug_log(f"Vectorstore not found at {persist_dir}")
     return None
+
+
 
 # =========================
 # RETRIEVER (MMR OPTIMIZED)
@@ -82,8 +128,10 @@ def get_retriever(vectorstore):
 def get_llm():
     return ChatGoogleGenerativeAI(
         model="gemini-2.0-flash",
-        temperature=0
+        temperature=0,
+        verbose=True
     )
+
 
 # =========================
 # PROMPT
@@ -114,13 +162,17 @@ Answer:
 # QA CHAIN
 # =========================
 def create_qa_chain(retriever, stream_handler=None):
+    debug_log("Creating QA chain")
+
     condense_llm = get_llm()
     
     if stream_handler:
         streaming_llm = ChatGoogleGenerativeAI(
             model="gemini-2.0-flash",
             temperature=0,
-            callbacks=[stream_handler]
+            streaming=True,
+            callbacks=[stream_handler],
+            verbose=True
         )
     else:
         streaming_llm = get_llm()
@@ -130,8 +182,12 @@ def create_qa_chain(retriever, stream_handler=None):
         condense_question_llm=condense_llm,
         retriever=retriever,
         return_source_documents=True,
-        combine_docs_chain_kwargs={"prompt": get_prompt()}
+        return_generated_question=True,
+        combine_docs_chain_kwargs={"prompt": get_prompt()},
+        verbose=True
     )
+
+
 
 # =========================
 # SUGGESTIONS
