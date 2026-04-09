@@ -4,13 +4,16 @@ import logging
 import sys
 import warnings
 from dotenv import load_dotenv
+import time
 
 # Aggressive warning suppression
 warnings.filterwarnings("ignore")
 os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["GLOG_minloglevel"] = "2"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 
-# Configure logging to be more robust
+# Configure logging
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
@@ -22,27 +25,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Guaranteed visibility debug log
 def debug_log(msg):
     logger.info(msg)
     print(f"\n>>> DEBUG_LOG [pipeline]: {msg}", file=sys.stderr, flush=True)
 
-
 load_dotenv()
+
+# Basic Imports
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters.character import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_classic.chains import ConversationalRetrievalChain
-from langchain_classic.prompts import PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
+
+# LCEL Imports
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.output_parsers import StrOutputParser
 
 # =========================
-# EMBEDDINGS (FAST + CACHED)
+# EMBEDDINGS (HuggingFace - Cached)
 # =========================
+@st.cache_resource
 def get_embeddings():
-    return GoogleGenerativeAIEmbeddings(
-        model="gemini-embedding-001"
+    """Returns a cached HuggingFace embeddings model."""
+    model_name = "sentence-transformers/all-MiniLM-L6-v2"
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={'normalize_embeddings': True}
     )
 
 # =========================
@@ -51,155 +62,145 @@ def get_embeddings():
 def process_pdfs(uploaded_files, chat_id):
     debug_log(f"Processing {len(uploaded_files)} PDF(s)")
     documents = []
-    os.makedirs(f"temp_{chat_id}", exist_ok=True)
+    temp_dir = f"temp_{chat_id}"
+    os.makedirs(temp_dir, exist_ok=True)
 
     for file in uploaded_files:
-        debug_log(f"Reading file: {file.name}")
-        path = os.path.join(f"temp_{chat_id}", file.name)
+        path = os.path.join(temp_dir, file.name)
         with open(path, "wb") as f:
             f.write(file.getbuffer())
 
         loader = PyPDFLoader(path)
         docs = loader.load()
-        debug_log(f"Loaded {len(docs)} pages from {file.name}")
-
         for d in docs:
             d.metadata["source"] = file.name
-
         documents.extend(docs)
-
+        try: os.remove(path)
+        except: pass
+            
+    try: os.rmdir(temp_dir)
+    except: pass
     return documents
-
 
 # =========================
 # TEXT SPLITTING
 # =========================
 def split_docs(documents):
-    debug_log(f"Splitting {len(documents)} document pages into chunks")
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=250
-    )
-    chunks = splitter.split_documents(documents)
-    debug_log(f"Created {len(chunks)} chunks")
-    return chunks
-
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    return splitter.split_documents(documents)
 
 # =========================
-# VECTOR STORE (CACHED)
+# VECTOR STORE (FAISS)
+# =========================
+def create_vectorstore(docs):
+    embeddings = get_embeddings()
+    return FAISS.from_documents(docs, embedding=embeddings)
+
+# =========================
+# LLM (Fast Flash model - Cached)
 # =========================
 @st.cache_resource
-def create_vectorstore(docs, chat_id):
-    debug_log("Creating vectorstore from chunks")
-    embeddings = get_embeddings()
-    persist_dir = f"db_{chat_id}"
-    vs = Chroma.from_documents(docs, embedding=embeddings, persist_directory=persist_dir)
-    debug_log(f"Vectorstore created and persisted to {persist_dir}")
-    return vs
-
-
-def load_vectorstore(chat_id):
-    persist_dir = f"db_{chat_id}"
-    debug_log(f"Attempting to load vectorstore from {persist_dir}")
-    if os.path.exists(persist_dir) and os.path.isdir(persist_dir) and len(os.listdir(persist_dir)) > 0:
-        embeddings = get_embeddings()
-        debug_log("Vectorstore found and directory is not empty.")
-        return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
-    debug_log(f"Vectorstore not found at {persist_dir}")
-    return None
-
-
-
-# =========================
-# RETRIEVER (MMR OPTIMIZED)
-# =========================
-def get_retriever(vectorstore):
-    return vectorstore.as_retriever(
-        search_type="mmr",
-        search_kwargs={
-            "k": 5,
-            "fetch_k": 20
-        }
-    )
-
-# =========================
-# LLM (FAST)
-# =========================
-def get_llm():
+def _get_base_llm():
+    """Returns a cached base LLM instance."""
     return ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
+        model="gemini-flash-latest",
         temperature=0,
         verbose=True
     )
 
-
-# =========================
-# PROMPT
-# =========================
-def get_prompt():
-    return PromptTemplate(
-        input_variables=["context", "question"],
-        template="""
-Answer using ONLY the given context.
-
-- Give the source of the information in the format of bullet points with the file name. For example:
-- [source_file.pdf]
-- If the context does not contain the answer, say "The answer is not in the provided context." Do not try to make up an answer.
-- If not found, say "I don't have the idea about what you are asking for. Sorry for inconvenience. Ask the relevant question. 
-Thank you for your understanding."
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
+def get_llm(streaming=False, callbacks=None):
+    """Returns an LLM instance, optionally with streaming."""
+    if not streaming:
+        return _get_base_llm()
+    
+    # For streaming, we need a fresh object to attach callbacks
+    return ChatGoogleGenerativeAI(
+        model="gemini-flash-latest",
+        temperature=0,
+        streaming=True,
+        callbacks=callbacks,
+        verbose=True
     )
 
 # =========================
 # QA CHAIN
 # =========================
-def create_qa_chain(retriever, stream_handler=None):
-    debug_log("Creating QA chain")
-
-    condense_llm = get_llm()
+def create_qa_chain(vectorstore, stream_handler=None):
+    llm = get_llm(streaming=bool(stream_handler), callbacks=[stream_handler] if stream_handler else None)
     
-    if stream_handler:
-        streaming_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
-            temperature=0,
-            streaming=True,
-            callbacks=[stream_handler],
-            verbose=True
-        )
-    else:
-        streaming_llm = get_llm()
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", (
+            "You are an assistant for question-answering tasks. "
+            "Use the provided context to answer the question. "
+            "If the answer is not contained within the context or if you are unsure, "
+            "simply state that you do not have enough details to answer based on the provided documents. "
+            "Do not use any outside knowledge or provide information not found in the context."
+        )),
+        ("human", "Context:\n{context}\n\nQuestion: {input}"),
+    ])
 
-    return ConversationalRetrievalChain.from_llm(
-        llm=streaming_llm,
-        condense_question_llm=condense_llm,
-        retriever=retriever,
-        return_source_documents=True,
-        return_generated_question=True,
-        combine_docs_chain_kwargs={"prompt": get_prompt()},
-        verbose=True
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    def get_retrieval_data(input_text):
+        start = time.time()
+        docs = retriever.invoke(input_text)
+        end = time.time()
+        return {
+            "context": format_docs(docs),
+            "source_documents": docs,
+            "db_time": end - start
+        }
+
+    def get_llm_answer(x):
+        start = time.time()
+        # We need to pass the context and input to the prompt
+        answer = (prompt | llm | StrOutputParser()).invoke({
+            "context": x["retrieval"]["context"],
+            "input": x["input"]
+        })
+        end = time.time()
+        return {
+            "answer": answer,
+            "llm_time": end - start
+        }
+
+    # LCEL RAG Chain with embedded timing
+    chain = (
+        RunnableParallel({
+            "retrieval": get_retrieval_data,
+            "input": RunnablePassthrough()
+        })
+        | RunnableParallel({
+            "generation": get_llm_answer,
+            "retrieval": lambda x: x["retrieval"]
+        })
     )
+    return chain
 
-
+# =========================
+# QA EXECUTION (Unified Interface)
+# =========================
+def run_qa(chain, query):
+    start_total = time.time()
+    result = chain.invoke(query)
+    end_total = time.time()
+    
+    return {
+        "answer": result['generation']['answer'],
+        "source_documents": result['retrieval']['source_documents'],
+        "metrics": {
+            "total_time": end_total - start_total,
+            "db_time": result['retrieval']['db_time'],
+            "llm_time": result['generation']['llm_time']
+        }
+    }
 
 # =========================
 # SUGGESTIONS
 # =========================
 def generate_suggestions(llm, answer):
-    prompt = f"""
-Based on the following answer, generate 3 directly related follow-up questions the user might logically ask next.
-Make them concise.
-
-Answer Context:
-{answer}
-
-Return only the 3 questions as bullet points without any other introductory text.
-"""
+    prompt = f"Based on the answer: {answer}, generate 3 short follow-up questions as bullet points."
     return llm.invoke(prompt)
